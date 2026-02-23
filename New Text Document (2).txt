@@ -1,0 +1,184 @@
+import os
+os.environ["GPIOZERO_PIN_FACTORY"] = "lgpio"
+
+import cv2
+import threading
+import time
+import numpy as np
+from gpiozero import LED, Buzzer, DistanceSensor
+from ultralytics import YOLO
+from flask import Flask, request, jsonify
+
+# ================= API (ESP8266 + DASHBOARD) =================
+
+app = Flask(__name__)
+
+esp_data = {}
+
+live_data = {
+    "animals": [],
+    "distance": 0,
+    "fog_status": "clear",
+    "esp": {}
+}
+
+@app.route("/esp", methods=["POST"])
+def receive_esp():
+    global esp_data
+    esp_data = request.json
+    return jsonify({"status": "ok"})
+
+@app.route("/api/live")
+def send_live():
+    return jsonify(live_data)
+
+def run_api():
+    app.run(host="0.0.0.0", port=5000)
+
+threading.Thread(target=run_api, daemon=True).start()
+
+# ================= AI + HARDWARE =================
+
+ANIMAL_CLASSES = ["person", "cow", "dog", "elephant", "deer", "leopard"]
+ELEPHANT_CLASS = "elephant"
+
+led = LED(17)
+buzzer = Buzzer(18)
+sensor = DistanceSensor(trigger=23, echo=24)
+
+cap = cv2.VideoCapture(0)
+cap.set(3, 640)
+cap.set(4, 480)
+
+model = YOLO("yolov8n.pt")
+CLASS_NAMES = model.names
+
+TRACK_ROI = np.array([
+    [120, 480],
+    [520, 480],
+    [420, 260],
+    [220, 260]
+])
+
+running = True
+
+# ================= SAFETY THREAD =================
+
+def safety_reset():
+    while True:
+        if not running:
+            led.off()
+            buzzer.off()
+            return
+        time.sleep(0.1)
+
+threading.Thread(target=safety_reset, daemon=True).start()
+
+# ================= FOG FUNCTIONS =================
+
+def fog_level(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    contrast = gray.std()
+
+    if contrast < 35:
+        return "heavy_fog"
+    elif contrast < 55:
+        return "light_fog"
+    else:
+        return "clear"
+
+def enhance_fog(frame):
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0)
+    cl = clahe.apply(l)
+    enhanced = cv2.merge((cl, a, b))
+    return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+
+# ================= ROI CHECK =================
+
+def is_inside_track(box, roi_polygon):
+    x1, y1, x2, y2 = map(int, box)
+    cx = int((x1 + x2) / 2)
+    cy = int((y1 + y2) / 2)
+    return cv2.pointPolygonTest(roi_polygon, (cx, cy), False) >= 0
+
+# ================= MAIN SYSTEM =================
+
+try:
+    print("SafeRail Vision System Running...")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        fog_status = fog_level(frame)
+        if fog_status != "clear":
+            frame = enhance_fog(frame)
+
+        results = model(frame)
+        annotated = results[0].plot()
+
+        detected_ids = results[0].boxes.cls.tolist() if results[0].boxes else []
+        boxes = results[0].boxes.xyxy.tolist() if results[0].boxes else []
+
+        detected_animals = []
+
+        for cls_id, box in zip(detected_ids, boxes):
+            obj = CLASS_NAMES[int(cls_id)]
+            if obj in ANIMAL_CLASSES and is_inside_track(box, TRACK_ROI):
+                detected_animals.append(obj)
+
+        try:
+            distance_cm = round(sensor.distance * 100, 1)
+        except:
+            distance_cm = -1
+
+        elephant_detected = ELEPHANT_CLASS in detected_animals
+        target_detected = len(detected_animals) > 0
+
+        # ===== ALERT LOGIC =====
+
+        if elephant_detected or (target_detected and 0 < distance_cm < 120):
+            led.on()
+            buzzer.on()
+        else:
+            led.off()
+            buzzer.off()
+
+        # ===== UPDATE DASHBOARD DATA =====
+
+        live_data["animals"] = detected_animals
+        live_data["distance"] = distance_cm
+        live_data["fog_status"] = fog_status
+        live_data["esp"] = esp_data
+
+        # ===== DISPLAY =====
+
+        cv2.polylines(annotated, [TRACK_ROI], True, (0, 255, 0), 2)
+
+        cv2.putText(annotated, f"Fog: {fog_status}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        cv2.putText(annotated, f"Distance: {distance_cm} cm", (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        cv2.putText(annotated, f"Animals: {detected_animals}", (20, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+        cv2.imshow("SafeRail Vision AI", annotated)
+
+        if cv2.waitKey(1) == 27:
+            break
+
+        time.sleep(0.04)
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    running = False
+    cap.release()
+    cv2.destroyAllWindows()
+    print("System safely stopped")
