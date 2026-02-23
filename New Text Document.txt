@@ -1,0 +1,170 @@
+import os
+os.environ["GPIOZERO_PIN_FACTORY"] = "lgpio"
+
+import cv2
+import threading
+import time
+from gpiozero import LED, Buzzer, DistanceSensor
+from ultralytics import YOLO
+import numpy as np
+
+# ---------------- ANIMAL CLASSES ONLY ----------------
+ANIMAL_CLASSES = [
+    "person", "cow", "dog", "elephant", "deer", "leopard"
+]
+
+ELEPHANT_CLASS = "elephant"
+
+# ---------------- DEVICES ----------------
+led = LED(17)
+buzzer = Buzzer(18)
+sensor = DistanceSensor(trigger=23, echo=24)
+
+# Camera setup
+cap = cv2.VideoCapture(0)
+cap.set(3, 640)
+cap.set(4, 480)
+
+# Load YOLO model
+model = YOLO("yolov8n.pt")
+CLASS_NAMES = model.names
+
+# ---------------- TRACK REGION OF INTEREST (ROI) ----------------
+# You MUST adjust these points to match your track in the camera view
+TRACK_ROI = np.array([
+    [120, 480],   # bottom-left
+    [520, 480],   # bottom-right
+    [420, 260],   # top-right
+    [220, 260]    # top-left
+])
+
+# ---------------- SAFETY WATCHDOG ----------------
+running = True
+
+def safety_reset():
+    while True:
+        if not running:
+            led.off()
+            buzzer.off()
+            led.close()
+            buzzer.close()
+            return
+        time.sleep(0.1)
+
+threading.Thread(target=safety_reset, daemon=True).start()
+
+# ---------------- FOG DETECTION ----------------
+def fog_level(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    contrast = gray.std()
+
+    if contrast < 35:
+        return "heavy_fog"
+    elif contrast < 55:
+        return "light_fog"
+    else:
+        return "clear"
+
+def enhance_fog(frame):
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0)
+    cl = clahe.apply(l)
+    enhanced = cv2.merge((cl, a, b))
+    return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+
+# ---------------- CHECK IF ANIMAL IS INSIDE TRACK ----------------
+def is_inside_track(box, roi_polygon):
+    x1, y1, x2, y2 = map(int, box)
+
+    # center of detected bounding box
+    cx = int((x1 + x2) / 2)
+    cy = int((y1 + y2) / 2)
+
+    # Check if the center point lies inside the ROI polygon
+    return cv2.pointPolygonTest(roi_polygon, (cx, cy), False) >= 0
+
+# ---------------- MAIN LOOP ----------------
+try:
+    print("SafeRail Wildlife Protection System Starting...")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Fog detection & enhancement
+        fog_status = fog_level(frame)
+        if fog_status != "clear":
+            frame = enhance_fog(frame)
+
+        # YOLO detection
+        results = model(frame)
+        annotated = results[0].plot()
+
+        detected_ids = results[0].boxes.cls.tolist() if results[0].boxes else []
+        boxes = results[0].boxes.xyxy.tolist() if results[0].boxes else []
+
+        detected_animals = []
+
+        # FILTER → Only animals + inside track ROI
+        for cls_id, box in zip(detected_ids, boxes):
+            obj = CLASS_NAMES[int(cls_id)]
+
+            if obj not in ANIMAL_CLASSES:
+                continue
+
+            if is_inside_track(box, TRACK_ROI):
+                detected_animals.append(obj)
+
+        # Distance sensor
+        try:
+            distance_cm = round(sensor.distance * 100, 1)
+        except:
+            distance_cm = -1
+
+        # Logic for alerts
+        target_detected = len(detected_animals) > 0
+        elephant_detected = ELEPHANT_CLASS in detected_animals
+
+        if elephant_detected:
+            led.on()
+            buzzer.on()
+            cv2.putText(annotated, "ELEPHANT WARNING!", (40, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+
+        elif target_detected and 0 < distance_cm < 120:
+            led.on()
+            buzzer.on()
+        else:
+            led.off()
+            buzzer.off()
+
+        # Draw track ROI on screen
+        cv2.polylines(annotated, [TRACK_ROI], True, (0, 255, 0), 2)
+
+        # Display info
+        cv2.putText(annotated, f"Fog: {fog_status}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        cv2.putText(annotated, f"Distance: {distance_cm} cm", (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        cv2.putText(annotated, f"Animals on Track: {detected_animals}", (20, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+        cv2.imshow("SafeRail Wildlife AI", annotated)
+
+        if cv2.waitKey(1) == 27:  # ESC to quit
+            break
+
+        time.sleep(0.04)
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    running = False
+    cap.release()
+    cv2.destroyAllWindows()
+    print("System safely stopped")
